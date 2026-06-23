@@ -80,7 +80,15 @@ class Logger:
 
         # 确定日志目录
         if log_dir is None:
-            from config_client import BASE_DIR
+            # 服务端分发场景只有 config_server.py，客户端场景有 config_client.py
+            # 两者都没有时（独立运行/测试）退到当前目录
+            try:
+                from config_server import BASE_DIR
+            except ImportError:
+                try:
+                    from config_client import BASE_DIR
+                except ImportError:
+                    BASE_DIR = os.getcwd()
             log_dir = os.path.join(BASE_DIR, 'logs')
 
         # 创建日志目录

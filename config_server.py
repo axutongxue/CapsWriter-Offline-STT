@@ -20,11 +20,26 @@ class ServerConfig:
     format_spell = True     # 输出时是否调整中英之间的空格
 
     enable_tray = True        # 是否启用托盘图标功能
-    hotwords_path = Path() / 'hot-server.txt' # 全局热词配置文件路径
+    hotwords_path = Path() / 'hot-server.txt' # 全局音素热词文件路径（每行一个词，可 "目标|别名1|别名2"）
+    hot_rule_path = Path() / 'hot-rule.txt'   # 规则热词文件路径（每行 "正则 = 替换"）
+    hot_thresh = 0.8          # 音素热词纠错阈值，分数 >= 此值才替换
+    hot_similar = 0.6         # 相似度提示阈值，>= 此值记入 similars 供参考
 
     # 日志配置
     log_level = 'DEBUG'        # 日志级别：'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'
     aligner_idle_timeout = 10  # 对齐引擎空闲多少秒后自动释放显存 (0 表示不释放)
+
+    # 文件转录配置
+    file_seg_duration = 60     # 转录文件时分段长度（秒），不追求低延迟可适当加大
+    file_seg_overlap = 8       # 转录文件时分段重叠（秒），8秒减少拼接处丢字
+    file_save_srt = True       # 是否保存 srt 字幕（默认开启）
+    file_save_txt = True       # 是否保存 txt 文本（按标点切分后的）
+    file_save_json = False     # 是否保存 json 结果（含原始字级时间戳，供手动校正后重新生成 srt）
+    file_save_merge = False    # 是否保存 merge.txt（未切分的段落长文本）
+
+    # 识别参数
+    context = ''               # 提示词上下文，辅助识别专有名词（如人名、地名、术语）
+    language = 'auto'          # 识别语言：'auto', 'chinese', 'english', 'japanese' 等
 
     # GPU 预加速配置（有识别任务时，提前调高显存频率，降低延迟，需管理员权限运行）
     gpu_boost_enabled = True                    # 总开关，默认开启
@@ -150,7 +165,13 @@ class Qwen3ASRGGUFArgs:
     llm_use_gpu = True          # 是否启用 GPU 加速 GGUF 模型
     
     # 模型细节
-    n_ctx = 2048                # 上下文窗口大小
+    # n_ctx: 上下文窗口大小，影响模型能"记住"的历史 token 数。
+    #   - 2048: 安全默认值，适合 6GB+ 显存的 GPU
+    #   - 4096: 推荐，适合 8GB+ 显存的 GPU，准确率提升明显
+    #   - 8192: 适合 12GB+ 显存的 GPU，长视频分段边界错误最少
+    #   n_ctx 翻倍，KV cache 显存占用也翻倍。
+    #   如果启动时 OOM，把 n_ctx 调回 2048。
+    n_ctx = 2048                # 上下文窗口大小（按 GPU 显存手动调整）
     chunk_size = 80.0           # 分段长度（秒）
     memory_num = 1              # 记忆段数
     dml_pad_to = 30             # 开启 DirectML 加速时，短音频统一填充到指定长度，有加速效果
@@ -178,11 +199,13 @@ class ForceAlignerGGUFArgs:
 # ──────────────────────────────────────────────────────────────────
 # 运行时覆盖配置 (runtime_config.json)
 # ──────────────────────────────────────────────────────────────────
-# 托盘菜单切换的 GPU 加速开关、转录模型等设置会写入 runtime_config.json，
+# 托盘菜单切换的 GPU 加速开关、转录模型、输出格式等设置会写入 runtime_config.json，
 # 下次启动时自动覆盖 ServerConfig 的默认值，实现持久化。
-# 仅支持覆盖以下字段：gpu_boost_enabled、model_type
 _RUNTIME_CONFIG_PATH = Path(BASE_DIR) / 'runtime_config.json'
-_RUNTIME_OVERRIDABLE_KEYS = ('gpu_boost_enabled', 'model_type')
+_RUNTIME_OVERRIDABLE_KEYS = (
+    'gpu_boost_enabled', 'model_type',
+    'file_save_srt', 'file_save_txt', 'file_save_json', 'file_save_merge',
+)
 
 
 def _apply_runtime_overrides():

@@ -11,11 +11,10 @@ if TYPE_CHECKING:
 
 
 # 可选的转录模型列表：(model_type, 显示名)
+# 仅保留 Qwen3-ASR 与 Fun-ASR-Nano，移除 SenseVoice / Paraformer
 _AVAILABLE_MODELS = [
     ('qwen_asr',     'Qwen3-ASR'),
     ('fun_asr_nano', 'Fun-ASR-Nano'),
-    ('sensevoice',   'SenseVoice'),
-    ('paraformer',   'Paraformer'),
 ]
 
 
@@ -76,7 +75,7 @@ class TrayManager:
     # ── 菜单构建 ──────────────────────────────────
 
     def _build_extra_menu_items(self):
-        """构建 GPU 加速勾选项 + 转录模型子菜单项。"""
+        """构建 GPU 加速勾选项 + 转录模型子菜单 + 输出格式子菜单。"""
         import pystray
         from pystray import MenuItem as item
 
@@ -90,8 +89,60 @@ class TrayManager:
                 '🎙️ 转录模型',
                 self._build_model_submenu(),
             ),
+            item(
+                '📄 输出格式',
+                self._build_output_format_submenu(),
+            ),
         ]
         return menu_items
+
+    def _build_output_format_submenu(self):
+        """
+        构建"输出格式"子菜单：SRT / TXT / JSON / merge 4 个可勾选项。
+        切换后只更新主进程 Config 并持久化（子进程不读取这些字段）。
+        """
+        import pystray
+        from pystray import MenuItem as item
+
+        # (Config 字段名, 显示名, 默认值) —— 默认 SRT 关，其余开
+        entries = [
+            ('file_save_srt',   'SRT 字幕 (.srt)',  False),
+            ('file_save_txt',   '文本 (.txt)',       True),
+            ('file_save_json',  'JSON 时间戳 (.json)', True),
+            ('file_save_merge', '合并文本 (.merge.txt)', False),
+        ]
+        sub_items = []
+        for key, display, default in entries:
+            sub_items.append(item(
+                display,
+                self._make_format_action(key),
+                checked=self._make_format_checked(key),
+            ))
+        return pystray.Menu(*sub_items)
+
+    def _make_format_action(self, key):
+        """为输出格式开关 key 生成 action(icon, item) 闭包，2 参数符合 pystray 校验。"""
+        def action(icon, item):
+            self._on_toggle_format(key, icon)
+        return action
+
+    @staticmethod
+    def _make_format_checked(key):
+        """为输出格式开关 key 生成 checked(item) 闭包，1 参数符合 pystray 运行时调用。"""
+        def checked(item):
+            from config_server import ServerConfig as Config
+            return bool(getattr(Config, key, False))
+        return checked
+
+    def _on_toggle_format(self, key: str, icon=None):
+        """输出格式开关切换：即时生效（主进程 Config）+ 持久化 + 刷新菜单。"""
+        old_val = bool(getattr(Config, key, False))
+        new_val = not old_val
+        setattr(Config, key, new_val)
+        save_runtime_overrides({key: new_val})
+        logger.info(f"输出格式 {key} 已切换为: {new_val}")
+        # 文件保存开关只影响主进程的 _save_result，不需要通知子进程
+        self._refresh_menu(icon)
 
     def _build_model_submenu(self):
         """构建转录模型单选子菜单。

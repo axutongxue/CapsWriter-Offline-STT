@@ -30,6 +30,7 @@ from .connection.server_manager import SocketManager
 from .ui.tray_manager import TrayManager
 from .ui.floating_window import FloatingWindow
 from .file_transcriber import ServerFileTranscriber
+from .hotword import HotwordManager
 from . import logger
 
 
@@ -55,6 +56,21 @@ class CapsWriterServer:
         self.process_manager = ProcessManager(self)
         self.socket_manager = SocketManager(self)
         self.tray_manager = TrayManager(self)
+
+        # 热词后处理管理器（音素纠错 + 规则替换 + token 同步）
+        # 路径来自 ServerConfig.hotwords_path / hot_rule_path；阈值取 hot_thresh / hot_similar
+        # 若配置是相对路径则锚定到 base_dir，避免依赖 cwd
+        hot_path = Path(str(Config.hotwords_path))
+        if not hot_path.is_absolute():
+            hot_path = self.base_dir / hot_path
+        rule_path = Path(str(Config.hot_rule_path))
+        if not rule_path.is_absolute():
+            rule_path = self.base_dir / rule_path
+        self.hotword_manager = HotwordManager(
+            hotword_files={'hot': hot_path, 'rule': rule_path},
+            threshold=getattr(Config, 'hot_thresh', 0.8),
+            similar_threshold=getattr(Config, 'hot_similar', 0.6),
+        )
 
         # 文件转录相关
         self.files = files or []
@@ -99,6 +115,12 @@ class CapsWriterServer:
         # 3. 停止托盘图标
         self.tray_manager.stop()
 
+        # 3.5 停止热词文件监视
+        try:
+            self.hotword_manager.stop()
+        except Exception:
+            pass
+
         # 4. 最后停止协程（需在其他资源释放之后）
         self.loop.stop()
 
@@ -135,6 +157,13 @@ class CapsWriterServer:
         # 托盘图标
         self.tray_manager.start()
         self._print_banner()
+
+        # 启动热词服务（加载 hot.txt / hot-rule.txt，开启文件监视）
+        # 即便热词库为空也安全：apply 内部会判断后跳过
+        try:
+            self.hotword_manager.start()
+        except Exception as e:
+            logger.warning(f"热词服务启动失败（不影响转录）：{e}")
 
         logger.info(f"启动参数: files={self.files}, files_count={len(self.files)}")
 

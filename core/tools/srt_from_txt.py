@@ -19,13 +19,15 @@ from datetime import timedelta
 from pathlib import Path
 from typing import List, Dict, Union
 
-import typer
 import srt
 from rich import print
-import re 
+import re
 
 
 import difflib
+
+# typer 仅在命令行入口使用，延迟到 __main__ 再导入，避免 PyInstaller 打包后
+# 缺少 typer 依赖时 `from core.tools import srt_from_txt` 触发 ImportError
 
 def lines_match_words(text_lines: List[str], words: List) -> List[srt.Subtitle]:
     """
@@ -154,6 +156,7 @@ def main(files: List[Path]):
         print(f'写入完成：{file}')
 
 if __name__ == '__main__':
+    import typer
     typer.run(main)
         
 
