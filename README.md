@@ -20,7 +20,7 @@
 
 软件就会自动在后台启动并进行转录，同时现在「模型加载」和「转录过程」都加上了**浮窗提示**，更加直观![](https://wework.qpic.cn/wwpic3az/546045_WpKqVlYMR1Cs-6j_1782313193/0)
 
-![](https://wework.qpic.cn/wwpic3az/916437_RgrxWNN3SQuSw89_1782313193/0)
+![](https://wework.qpic.cn/wwpic3az/184720_hZ1IahjzRg6vxWj_1782313518/0)
 
 除了视频，**音频转文字**也是完全支持的。如果你下载过一些播客，这个软件也用得上
 
@@ -42,14 +42,20 @@
 
 并且 **Fun-ASR-Nano 内存占用会更低一点，对低配机器更友好**，所以大家可以按自己实际情况来选择![](https://wework.qpic.cn/wwpic3az/558838_Wj1sd1vFR0yrhbR_1782313193/0)
 
-补充说明一下，软件首次使用时可能会弹出防火墙弹窗，这个直接选允许访问即可
+# 补充说明
+
+软件首次使用时可能会弹出防火墙弹窗，这个直接选允许访问即可
 
 ![](https://wework.qpic.cn/wwpic3az/628131_Rgyy1fISR3WDlR-_1782313193/0)
 
-仅是软件会在本地跑一个后台服务器，不涉及任何网络传输行为，你把「电脑断网」软件一样可正常使用
+仅是软件会在本地跑一个后台服务器，不涉及任何网络传输行为，你把**「电脑断网」**软件一样可正常使用
 
-最最后补充一下，如果你想问**在线视频**怎么转文字呢？请看我之前发的这篇文章[《各平台官方免费视频转文字＋AI总结方法》](https://mp.weixin.qq.com/s/b2ku0b6VMbMX133GAvfOrg)
+如果你想问**在线视频**怎么转文字呢？
+
+请看我之前发的这篇文章[《各平台官方免费视频转文字＋AI总结方法》](https://mp.weixin.qq.com/s/b2ku0b6VMbMX133GAvfOrg)
 
 ![](https://wework.qpic.cn/wwpic3az/694157_mSJic5FtT6yCURk_1782313193/0)
 
-![](https://wework.qpic.cn/wwpic3az/514338_IwA2wyHXTyydcEM_1782313193/0)
+# 关于作者
+
+![](https://wework.qpic.cn/wwpic3az/204530_pPKgyISBRuS8evJ_1782314026/0)
