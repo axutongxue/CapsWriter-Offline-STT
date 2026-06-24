@@ -75,7 +75,7 @@ class TrayManager:
     # ── 菜单构建 ──────────────────────────────────
 
     def _build_extra_menu_items(self):
-        """构建 GPU 加速勾选项 + 转录模型子菜单 + 输出格式子菜单。"""
+        """构建 GPU 加速勾选项 + 转录模型子菜单 + 输出格式子菜单 + 关于作者。"""
         import pystray
         from pystray import MenuItem as item
 
@@ -92,6 +92,10 @@ class TrayManager:
             item(
                 '📄 输出格式',
                 self._build_output_format_submenu(),
+            ),
+            item(
+                'ℹ️ 关于作者',
+                self._make_about_action(),
             ),
         ]
         return menu_items
@@ -179,6 +183,88 @@ class TrayManager:
         return checked
 
     # ── 菜单回调 ──────────────────────────────────
+
+    def _make_about_action(self):
+        """生成「关于作者」菜单 action(icon, item) 闭包，2 参数符合 pystray 校验。"""
+        def action(icon, item):
+            self._on_show_about(icon)
+        return action
+
+    def _on_show_about(self, icon=None):
+        """显示「关于作者」弹窗（独立线程，避免阻塞托盘）。"""
+        logger.info("「关于作者」菜单已点击，启动弹窗线程")
+        try:
+            t = threading.Thread(target=self._show_about_dialog, daemon=True)
+            t.start()
+        except Exception as e:
+            logger.error(f"启动「关于作者」弹窗线程失败: {e}")
+
+    @staticmethod
+    def _show_about_dialog():
+        """用 tkinter 弹出「关于作者」窗口，含可点击链接。
+
+        关键点：PyInstaller 打包后 internal/tkinter 目录不含 ttk 子模块，
+        所以只用 tk.Label / tk.Button / tk.Frame，避免 import ttk 失败。
+        """
+        try:
+            import webbrowser
+            import tkinter as tk
+        except ImportError as e:
+            logger.error(f"tkinter 导入失败，无法显示关于弹窗: {e}")
+            return
+
+        root = tk.Tk()
+        root.title("关于作者")
+        root.geometry("520x340")
+        root.resizable(False, False)
+
+        # 内容（Markdown 风格转纯文本 + 可点击链接）
+        info = [
+            ("作者微信公众号", "阿虚同学", None),
+            ("软件官网", "axutongxue.net", "https://axutongxue.net/"),
+            ("本项目开源地址", "CapsWriter-Offline-STT", "https://github.com/axutongxue/CapsWriter-Offline-STT"),
+            ("基于项目", "HaujetZhao/CapsWriter-Offline", "https://github.com/HaujetZhao/CapsWriter-Offline"),
+        ]
+
+        # 标题
+        tk.Label(root, text="CapsWriter-Offline-STT", font=("Microsoft YaHei", 14, "bold"),
+                 pady=15).pack()
+
+        # 用普通 Frame 替代 ttk.Frame
+        content_frame = tk.Frame(root, padx=15, pady=5)
+        content_frame.pack(fill="both", expand=True)
+
+        def make_click_handler(url):
+            def handler(_event=None):
+                try:
+                    webbrowser.open(url)
+                except Exception as e:
+                    logger.error(f"打开链接失败 {url}: {e}")
+            return handler
+
+        for label_text, text, url in info:
+            row = tk.Frame(content_frame)
+            row.pack(fill="x", pady=5)
+            tk.Label(row, text=f"{label_text}：", width=14, anchor="e").pack(side="left")
+            if url:
+                link = tk.Label(row, text=text, fg="#1a73e8", cursor="hand2",
+                                font=("Microsoft YaHei", 9, "underline"))
+                link.pack(side="left")
+                link.bind("<Button-1>", make_click_handler(url))
+            else:
+                tk.Label(row, text=text).pack(side="left")
+
+        # 致谢
+        tk.Label(root, text="感谢原作者的付出", font=("Microsoft YaHei", 9),
+                 fg="#666", pady=10).pack()
+
+        # 关闭按钮（普通 tk.Button 替代 ttk.Button）
+        tk.Button(root, text="关闭", command=root.destroy, padx=20).pack(pady=5)
+
+        try:
+            root.mainloop()
+        except Exception as e:
+            logger.error(f"关于弹窗 mainloop 异常: {e}")
 
     def _on_toggle_gpu_boost(self, icon, item):
         """GPU 预加速勾选切换：即时生效 + 持久化 + 通知子进程。"""

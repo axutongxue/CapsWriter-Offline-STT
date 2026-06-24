@@ -20,7 +20,6 @@
 
 import json
 import re
-import shutil
 import subprocess
 import time
 import uuid
@@ -28,6 +27,7 @@ from pathlib import Path
 from typing import List, Optional, Callable
 
 from config_server import ServerConfig as Config
+from core.tools.ffmpeg_resolver import get_ffmpeg, get_ffprobe
 from core.constants import AudioFormat
 from core.server.schema import Task, Result
 from . import logger
@@ -93,14 +93,14 @@ class ServerFileTranscriber:
 
     def _check_environment(self) -> bool:
         """检查 FFmpeg 环境"""
-        if shutil.which('ffmpeg') is None:
+        if get_ffmpeg() is None:
             logger.error("未检测到 FFmpeg，无法进行文件转录")
             return False
         return True
 
     def _get_audio_duration(self) -> float:
         """通过 ffprobe 获取音频时长"""
-        ffprobe_path = shutil.which('ffprobe')
+        ffprobe_path = get_ffprobe()
         if ffprobe_path is None:
             return 0.0
         cmd = [
@@ -145,8 +145,12 @@ class ServerFileTranscriber:
             state.sockets_id.append(LOCAL_SOCKET_ID)
 
         # FFmpeg 提取音频
+        ffmpeg_path = get_ffmpeg()
+        if ffmpeg_path is None:
+            logger.error("环境检查异常：实际启动 ffmpeg 时未找到可执行文件")
+            return False
         ffmpeg_cmd = [
-            "ffmpeg", "-i", str(self.file),
+            ffmpeg_path, "-i", str(self.file),
             "-f", "f32le", "-ac", "1", "-ar", "16000", "-"
         ]
 

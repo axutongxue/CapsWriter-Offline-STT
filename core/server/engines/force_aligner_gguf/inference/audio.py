@@ -4,12 +4,13 @@ audio.py - 音频预处理工具类
 """
 import os
 import math
-import shutil
 import subprocess
 import numpy as np
 import soundfile as sf
 from pathlib import Path
 from . import logger
+
+from core.tools.ffmpeg_resolver import require_ffmpeg, has_ffmpeg
 
 
 def numpy_resample_poly(x, up, down, window_size=10):
@@ -86,16 +87,15 @@ def load_audio_numpy(audio_path, sample_rate=24000, start_second=None, duration=
 
 
 def check_ffmpeg():
-    """检测系统是否安装 ffmpeg"""
-    return shutil.which('ffmpeg') is not None
+    """检测是否可用 ffmpeg"""
+    return has_ffmpeg()
 
 
 def load_audio_ffmpeg(audio_path, sample_rate=24000, start_second=None, duration=None):
     """使用 ffmpeg 直接读取音频"""
-    if not check_ffmpeg():
-        raise RuntimeError("系统未发现 ffmpeg。请先安装 ffmpeg 并将其添加到系统环境变量 PATH 中。")
+    ffmpeg_path = require_ffmpeg()
 
-    cmd = ['ffmpeg', '-y', '-i', str(audio_path)]
+    cmd = [ffmpeg_path, '-y', '-i', str(audio_path)]
 
     if start_second is not None:
         cmd.extend(['-ss', str(start_second)])
