@@ -37,8 +37,23 @@ class GpuBoostManager:
             return
 
         logger.info(f"GPU 加速命令: {Config.gpu_boost_cmd}")
-        subprocess.run(Config.gpu_boost_cmd, shell=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            result = subprocess.run(
+                Config.gpu_boost_cmd, shell=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=0x08000000 if __import__('sys').platform == 'win32' else 0,
+            )
+        except Exception as e:
+            logger.warning(f"GPU 加速命令执行异常: {e}")
+            return
+        if result.returncode != 0:
+            err = (result.stderr or b'').decode('utf-8', errors='ignore').strip()
+            logger.warning(
+                f"GPU 加速命令未生效（rc={result.returncode}）。"
+                f"NVIDIA 卡请确认已安装 nvidia-smi；AMD 卡需改为 rocm-smi 命令并需 ROCm + 管理员权限。"
+                + (f" 输出: {err}" if err else "")
+            )
+            return
         self.state.gpu_boosted = True
         self.state.gpu_last_active = 0  # 0 表示已加速但尚未有实际音频任务使用过
 
@@ -73,8 +88,14 @@ class GpuBoostManager:
             return
 
         logger.info(f"GPU 闲置 {idle_time:.0f}s，取消加速: {Config.gpu_unboost_cmd}")
-        subprocess.run(Config.gpu_unboost_cmd, shell=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            subprocess.run(
+                Config.gpu_unboost_cmd, shell=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=0x08000000 if __import__('sys').platform == 'win32' else 0,
+            )
+        except Exception as e:
+            logger.warning(f"GPU 取消加速命令执行异常: {e}")
         self.state.gpu_boosted = False
         self.state.gpu_last_active = 0.0
 

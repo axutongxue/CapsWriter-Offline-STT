@@ -26,32 +26,21 @@ class SocketManager:
         self._is_running = False
         self._server = None  # websockets.serve 返回的 server 对象
 
-    def _check_port(self):
-        """检查端口可用性"""
-        import socket
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind((Config.addr, int(Config.port)))
-                return True
-            except socket.error:
-                logger.error(f"端口冲突：{Config.addr}:{Config.port} 已被占用，请检查是否已有服务端正在运行。")
-                return False
-
     async def start(self):
         """
         启动 WebSocket 网络服务
+
+        端口抢占已在 CapsWriterServer.start() 用 _try_bind_port() 完成，
+        这里不再重复检测，直接拉起 websockets.serve。
+        极端竞态下仍可能 bind 失败（_try_bind_port 与 serve 之间又有实例先 bind），
+        抛 OSError 由上层 start() 兜住转 client，不在此处崩溃。
         """
         if self._is_running: return
-        
-        # 0. 启动前自检环境
-        if not self._check_port():
-            input("\n按回车键退出...")
-            return 
 
         self._is_running = True
 
         loop = self.app.loop
-        
+
         # 1. 优化守护线程执行器 (防止阻塞事件循环)
         from core.tools.daemon_executor import SimpleDaemonExecutor
         loop.set_default_executor(SimpleDaemonExecutor())
@@ -61,7 +50,11 @@ class SocketManager:
 
         # 3. 启动服务
         logger.info(f"正在拉起 WebSocket 服务 (监听: {Config.addr}:{Config.port})")
-        
+
+        # 释放 app._try_bind_port 占住的占位 listening socket，让 websockets.serve 立即
+        # 重新 bind。释放与 serve 之间是毫秒级窗口，远小于进程间启动间隔，竞态可忽略。
+        self.app._release_port_holder()
+
         async with websockets.serve(
             handler,
             Config.addr,
@@ -74,7 +67,7 @@ class SocketManager:
             # 4. 进入识别结果发送循环 (作为主阻塞任务)
             logger.info("WebSocket 发送协程已就绪")
             await ws_send(self.app)
-            
+
         self._is_running = False
         logger.info("SocketManager: WebSocket 服务已退出")
 

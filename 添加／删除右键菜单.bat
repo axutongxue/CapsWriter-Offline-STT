@@ -1,44 +1,11 @@
 @echo off
-setlocal enabledelayedexpansion
-
-set "menu_name=CapsWriter рТйсф╣в╙ндвж"
-set "exe_path=%~dp0start_server.exe"
-
-if not exist "%exe_path%" (
-    echo ╢МнС: ур╡╩╣╫ start_server.exe
-    pause
-    exit /b 1
+chcp 65001 >nul
+cd /d "%~dp0"
+python install_menu.py
+if %errorlevel% neq 0 (
+    echo.
+    echo Б ═ Python Ф°╙Е╝┴Хё┘Ф┬√ install_menu.py Ф┴╖Х║▄Е╓╠Х╢╔
+    echo Х╞╥Г║╝Д©²Е╥╡Е╝┴Хё┘ Python 3О╪▄Ф┬√Е°╗Г╩┬Г╚╞Д╦╜Ф┴▀Е┼╗Х©░Х║▄:
+    echo     python install_menu.py
 )
-
-set "video_ext=mp4 mkv flv webm avi mov wmv mpeg mpg rmvb ts 3gp"
-set "audio_ext=mp3 wav flac ape aac wma ogg"
-
-reg query "HKCU\Software\Classes\SystemFileAssociations\.mp4\shell\%menu_name%" >nul 2>nul
-if %errorlevel%==0 (
-    echo.
-    echo   уЩтзп╤тьср╪Э╡к╣╔...
-    for %%i in (%video_ext%) do (
-        reg delete "HKCU\Software\Classes\SystemFileAssociations\.%%i\shell\%menu_name%" /f >nul 2>nul
-    )
-    for %%i in (%audio_ext%) do (
-        reg delete "HKCU\Software\Classes\SystemFileAssociations\.%%i\shell\%menu_name%" /f >nul 2>nul
-    )
-    echo.
-    echo   п╤тьмЙЁиё║
-) else (
-    echo.
-    echo   уЩтз╟╡в╟ср╪Э╡к╣╔...
-    for %%i in (%video_ext%) do (
-        reg add "HKCU\Software\Classes\SystemFileAssociations\.%%i\shell\%menu_name%" /d "%menu_name%" /f >nul 2>nul
-        reg add "HKCU\Software\Classes\SystemFileAssociations\.%%i\shell\%menu_name%\command" /d ""%exe_path%" "%%1"" /f >nul 2>nul
-    )
-    for %%i in (%audio_ext%) do (
-        reg add "HKCU\Software\Classes\SystemFileAssociations\.%%i\shell\%menu_name%" /d "%menu_name%" /f >nul 2>nul
-        reg add "HKCU\Software\Classes\SystemFileAssociations\.%%i\shell\%menu_name%\command" /d ""%exe_path%" "%%1"" /f >nul 2>nul
-    )
-    echo.
-    echo   ╟╡в╟мЙЁиё║ср╪Э╣Ц╩ВрТйсф╣нд╪Ч╪╢©ий╧сц║ё
-)
-
-echo.
 pause
