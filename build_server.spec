@@ -3,6 +3,9 @@
 Server-only PyInstaller build spec
 仅打包 start_server.exe，用于右键菜单转录场景
 
+改动记录（2026-08-29）：
+- onnxruntime: 显式收集 capi 全部 DLL（onnxruntime.dll / DirectML.dll / providers_shared.dll / pybind11_state.pyd）
+- 打包后校验：internal/onnxruntime/capi 必须包含 DML 关键组件，避免发行版无声丢失 DML 能力
 改动记录（2026-06-23）：
 - hiddenimports 加入 rapidfuzz（热词音素 RAG 需要）
 - excludes 移除 rapidfuzz（原为 Client 独有，现在 Server 也用）
@@ -10,19 +13,36 @@ Server-only PyInstaller build spec
 - my_files 去掉已删的 hot.txt 和 add_context_menu.bat
 """
 
-from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules, collect_dynamic_libs
 from os.path import join, basename, dirname, exists
 from os import walk, makedirs
 from shutil import copyfile, rmtree
 
 # ==================== 打包配置选项 ====================
 INCLUDE_CUDA_PROVIDER = False
+REQUIRE_DML = True    # onnxruntime 必须携带 DirectML 组件（用于 ONNX 编码器显卡加速）
 # ====================================================
 
 # 初始化空列表
 binaries = []
 hiddenimports = []
 datas = []
+
+# 收集 onnxruntime 全部动态库（DirectML 组件必须进入发行版，否则 DML 编码加速不可用）
+try:
+    ort_binaries = collect_dynamic_libs('onnxruntime')
+    for src, dest in ort_binaries:
+        if not any(x in basename(src).lower() for x in ('onnxruntime.dll', '.pyd', 'directml.dll', 'providers_shared.dll')):
+            continue  # 只保留运行期真正需要的组件，剔除无关 dll
+        binaries.append((src, dest))
+        print(f"[INFO] 收集 onnxruntime 组件: {basename(src)}")
+    # 捕获外壳 DLL（提供扩展名 variant）
+    ort_shim = collect_dynamic_libs('onnxruntime.capi')
+    for src, dest in ort_shim:
+        if '.pyd' in basename(src) or 'onnxruntime.dll' in basename(src).lower():
+            binaries.append((src, dest))
+except Exception as e:
+    print(f"[WARN] 收集 onnxruntime 动态库失败: {e}")
 
 # 收集 sherpa_onnx 相关文件
 try:
@@ -217,3 +237,17 @@ for file in my_files:
 
 # 不再创建软连接 — 根目录的 start_server.exe 直接访问同目录的 core/models/assets/LLM 等
 # 打包完成后需手动将 dist/root/ 下的 start_server.exe 和 internal/ 复制到项目根目录
+
+# ==================== 打包后校验 ====================
+# 校验 DML 组件是否进入 internal（缺失会导致 ONNX 编码器无法使用 DirectML 加速）
+if REQUIRE_DML:
+    missing = []
+    for dll_name in ('onnxruntime.dll', 'onnxruntime_pybind11_state.pyd', 'DirectML.dll'):
+        p = join('dist', 'root', 'internal', 'onnxruntime', 'capi', dll_name)
+        if not exists(p):
+            missing.append(dll_name)
+    if missing:
+        raise SystemExit(f"[FATAL] 打包产物缺少 onnxruntime DML 组件: {missing}。"
+                         f"请确认打包环境安装了 onnxruntime-directml（如 pip install onnxruntime-directml）。")
+    else:
+        print("[INFO] 打包校验通过: internal/onnxruntime/capi 含全部 DML 组件")
