@@ -55,10 +55,13 @@ class EngineFactory:
 
         loader = EngineFactory._ASR_LOADERS[model_type]
         EngineClass, ConfigClass, ArgsObj = loader()
-        
+
         config_data = {k: v for k, v in ArgsObj.__dict__.items() if not k.startswith('_')}
+        # 合并托盘按引擎保存的覆盖项（onnx_provider / llm_use_gpu 等，需重启生效）
+        from config_server import get_engine_overrides
+        config_data.update(get_engine_overrides(model_type))
         config = ConfigClass(**config_data)
-        
+
         return EngineClass(config)
 
     # --- 辅助引擎加载器 ---

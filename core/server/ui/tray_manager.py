@@ -3,7 +3,11 @@ from __future__ import annotations
 import os
 import threading
 from typing import TYPE_CHECKING
-from config_server import ServerConfig as Config, save_runtime_overrides
+from config_server import (
+    ServerConfig as Config, save_runtime_overrides,
+    get_engine_overrides, save_engine_overrides,
+    ParaformerArgs, SenseVoiceArgs, FunASRNanoGGUFArgs, Qwen3ASRGGUFArgs,
+)
 from ..state import console
 from .. import logger
 if TYPE_CHECKING:
@@ -16,6 +20,17 @@ _AVAILABLE_MODELS = [
     ('qwen_asr',     'Qwen3-ASR'),
     ('fun_asr_nano', 'Fun-ASR-Nano'),
 ]
+
+# model_type -> 对应 Args 配置类（用于读取引擎默认值，托盘勾选状态回退用）
+_ENGINE_ARGS = {
+    'sensevoice':   SenseVoiceArgs,
+    'fun_asr_nano': FunASRNanoGGUFArgs,
+    'qwen_asr':     Qwen3ASRGGUFArgs,
+    'paraformer':   ParaformerArgs,
+}
+
+# 支持 GGUF GPU 解码 (llm_use_gpu) 的引擎
+_GGUF_ENGINES = ('qwen_asr', 'fun_asr_nano', )
 
 
 class TrayManager:
@@ -84,6 +99,10 @@ class TrayManager:
                 '⚡ GPU 预加速',
                 self._on_toggle_gpu_boost,
                 checked=lambda _it: bool(Config.gpu_boost_enabled),
+            ),
+            item(
+                '🎤 显卡加速',
+                self._build_gpu_accel_submenu(),
             ),
             item(
                 '🎙️ 转录模型',
@@ -180,6 +199,116 @@ class TrayManager:
         def checked(item):
             from config_server import ServerConfig as Config
             return Config.model_type.lower() == mt
+        return checked
+
+    # ── 显卡加速子菜单 ──────────────────────────────
+
+    def _engine_default(self, model_type: str, key: str):
+        """读取引擎 Args 类中某字段的默认值（无覆盖时的出厂状态）。"""
+        ArgsCls = _ENGINE_ARGS.get(model_type)
+        if ArgsCls is None:
+            return None
+        return getattr(ArgsCls, key, None)
+
+    def _engine_setting(self, model_type: str, key: str):
+        """读引擎设置当前生效值：托盘覆盖项优先，否则回落到 Args 默认值。"""
+        overrides = get_engine_overrides(model_type)
+        if key in overrides:
+            return overrides[key]
+        return self._engine_default(model_type, key)
+
+    def _build_gpu_accel_submenu(self):
+        """构建「显卡加速」子菜单（作用于当前转录模型的引擎，改后需重启生效）。
+
+        依据文档《显卡加速的若干问题》暴露的设置项：
+        - ONNX 编码加速 (DirectML)：onnx_provider CPU ↔ DML
+        - GGUF 解码用显卡 (llm_use_gpu)：仅 GGUF 引擎显示
+        - 集显兼容补丁 (VK_DISABLE_COOPMAT / VK_DISABLE_F16)：仅 GGUF 引擎显示
+        """
+        import pystray
+        from pystray import MenuItem as item
+
+        mt = str(Config.model_type).lower()
+        sub_items = []
+
+        # 1. ONNX 编码加速（DML）
+        sub_items.append(item(
+            'ONNX 编码加速 (DirectML)',
+            self._make_engine_toggle_action('onnx_provider', 'DML', 'CPU'),
+            checked=self._make_provider_checked(),
+        ))
+
+        # 2. GGUF 解码 + 集显补丁（仅 GGUF 引擎）
+        if mt in _GGUF_ENGINES:
+            sub_items.append(item(
+                'GGUF 解码用显卡',
+                self._make_engine_toggle_action('llm_use_gpu', True, False),
+                checked=self._make_engine_checked('llm_use_gpu'),
+            ))
+            sub_items.append(pystray.Menu.SEPARATOR)
+            sub_items.append(item(
+                '集显补丁: 禁用 COOPMAT',
+                self._make_compat_action('vk_disable_coopmat'),
+                checked=self._make_compat_checked('vk_disable_coopmat'),
+            ))
+            sub_items.append(item(
+                '集显补丁: 禁用 F16',
+                self._make_compat_action('vk_disable_f16'),
+                checked=self._make_compat_checked('vk_disable_f16'),
+            ))
+
+        return pystray.Menu(*sub_items)
+
+    def _make_provider_checked(self):
+        """onnx_provider 勾选状态：DML 为勾选。"""
+        def checked(item):
+            mt = str(Config.model_type).lower()
+            return str(self._engine_setting(mt, 'onnx_provider')).upper() == 'DML'
+        return checked
+
+    def _make_engine_checked(self, key):
+        """布尔引擎字段（llm_use_gpu 等）勾选状态。"""
+        def checked(item):
+            mt = str(Config.model_type).lower()
+            return bool(self._engine_setting(mt, key))
+        return checked
+
+    def _make_engine_toggle_action(self, key, on_val, off_val):
+        """切换引擎字段：持久化到 engine_overrides[当前model_type]，提示重启。"""
+        def action(icon, item):
+            mt = str(Config.model_type).lower()
+            cur = self._engine_setting(mt, key)
+            # onnx_provider 是字符串比较，其他是布尔
+            is_on = (str(cur).upper() == str(on_val).upper()) if isinstance(on_val, str) else bool(cur)
+            new_val = off_val if is_on else on_val
+            save_engine_overrides(mt, {key: new_val})
+            logger.info(f"引擎设置 {mt}.{key} 已切换为: {new_val}（需重启生效）")
+            self.show_notification(
+                "CapsWriter",
+                f"设置已保存（{key} = {new_val}）\n请点击托盘菜单的「重启」以生效"
+            )
+            self._refresh_menu(icon)
+        return action
+
+    def _make_compat_action(self, key):
+        """集显补丁开关：写 ServerConfig 顶层字段（全局生效，不分引擎）。"""
+        def action(icon, item):
+            new_val = not bool(getattr(Config, key, False))
+            setattr(Config, key, new_val)
+            save_runtime_overrides({key: new_val})
+            logger.info(f"集显补丁 {key} 已切换为: {new_val}（需重启生效）")
+            self.show_notification(
+                "CapsWriter",
+                f"集显补丁已{'开启' if new_val else '关闭'}\n请点击托盘菜单的「重启」以生效"
+            )
+            self._refresh_menu(icon)
+        return action
+
+    @staticmethod
+    def _make_compat_checked(key):
+        """集显补丁勾选状态（读 ServerConfig 顶层字段）。"""
+        def checked(item):
+            return bool(getattr(Config, key, False))
         return checked
 
     # ── 菜单回调 ──────────────────────────────────

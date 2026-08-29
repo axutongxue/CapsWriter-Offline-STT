@@ -5,6 +5,7 @@
 负责 ASR 引擎和标点模型的实例化，支持多种后端引擎的一致性加载。
 """
 
+import os
 import time
 from core.server.state import console
 from config_server import (
@@ -44,6 +45,14 @@ class ModelLoader:
         t1 = time.time()
         model_type = Config.model_type.lower()
         logger.info(f"Loader 开始初始化语音系统 (引擎: {model_type})")
+
+        # 集显兼容性补丁：须在 llama.cpp Vulkan 后端初始化（引擎加载）前设置环境变量
+        if getattr(Config, 'vk_disable_coopmat', False):
+            os.environ['GGML_VK_DISABLE_COOPMAT'] = '1'
+            logger.info("集显兼容补丁：已设置 GGML_VK_DISABLE_COOPMAT=1")
+        if getattr(Config, 'vk_disable_f16', False):
+            os.environ['GGML_VK_DISABLE_F16'] = '1'
+            logger.info("集显兼容补丁：已设置 GGML_VK_DISABLE_F16=1")
 
         try:
             # 2. 通过工厂实例化 ASR 核心引擎

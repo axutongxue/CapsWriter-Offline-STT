@@ -47,9 +47,11 @@ class ServerConfig:
     gpu_unboost_cmd = 'nvidia-smi -rmc'         # GPU 取消预加速命令，恢复显存到默认频率
     gpu_unboost_timeout = 1                     # 空闲多少秒后取消加速
 
-    # 集成显卡兼容性补丁
-    # os.environ["GGML_VK_DISABLE_COOPMAT"] = "1"   # AMD集显无法加载 GGUF 模型时尝试
-    # os.environ["GGML_VK_DISABLE_F16"] = "1"       # 集成显卡解码有误，强制熔断时尝试
+    # 集成显卡兼容性补丁（托盘菜单可切换，改后需重启生效）
+    # vk_disable_coopmat=True 时等效环境变量 GGML_VK_DISABLE_COOPMAT=1（AMD 集显无法加载 GGUF 模型时尝试）
+    # vk_disable_f16=True 时等效环境变量 GGML_VK_DISABLE_F16=1（集显解码有误、强制熔断时尝试）
+    vk_disable_coopmat = False
+    vk_disable_f16 = False
 
 
 
@@ -203,9 +205,22 @@ class ForceAlignerGGUFArgs:
 # 下次启动时自动覆盖 ServerConfig 的默认值，实现持久化。
 _RUNTIME_CONFIG_PATH = Path(BASE_DIR) / 'runtime_config.json'
 _RUNTIME_OVERRIDABLE_KEYS = (
-    'gpu_boost_enabled', 'model_type',
+    'gpu_boost_enabled', 'model_type', 'vk_disable_coopmat', 'vk_disable_f16',
     'file_save_srt', 'file_save_txt', 'file_save_json', 'file_save_merge',
 )
+
+# 按引擎嵌套存储的托盘覆盖项：{model_type: {字段名: 值}}
+# 由托盘菜单写入，EngineFactory 创建引擎时按当前 model_type 合并进对应 Args 类。
+# 允许覆盖的字段白名单（避免任意键注入）：
+_ENGINE_OVERRIDE_KEYS = {
+    'sensevoice':   ('onnx_provider',),
+    'fun_asr_nano': ('onnx_provider', 'llm_use_gpu', 'vulkan_force_fp32'),
+    'qwen_asr':     ('onnx_provider', 'llm_use_gpu', 'vulkan_force_fp32'),
+    'paraformer':   ('provider',),
+}
+
+# 运行时保存的按引擎覆盖项（save_engine_overrides 写入，get_engine_overrides 读取）
+_ENGINE_OVERRIDES: dict = {}
 
 
 def _apply_runtime_overrides():
@@ -218,11 +233,69 @@ def _apply_runtime_overrides():
         if not isinstance(overrides, dict):
             return
         for key, val in overrides.items():
+            if key == 'engine_overrides':
+                # 按引擎嵌套项：只保留白名单字段，供 EngineFactory 合并
+                if isinstance(val, dict):
+                    for mt, kv in val.items():
+                        if not isinstance(mt, str) or mt not in _ENGINE_OVERRIDE_KEYS or not isinstance(kv, dict):
+                            continue
+                        valid = _ENGINE_OVERRIDE_KEYS[mt]
+                        _ENGINE_OVERRIDES[mt] = {k: v for k, v in kv.items() if k in valid}
+                continue
             if key in _RUNTIME_OVERRIDABLE_KEYS and hasattr(ServerConfig, key):
                 setattr(ServerConfig, key, val)
     except Exception as _e:
         # 加载失败不应阻断启动
         print(f"[config_server] 加载 runtime_config.json 失败: {_e}")
+
+
+def get_engine_overrides(model_type: str = None) -> dict:
+    """获取当前（或指定）引擎的托盘覆盖项字典。"""
+    if model_type is None:
+        model_type = ServerConfig.model_type
+    return dict(_ENGINE_OVERRIDES.get(str(model_type).lower(), {}))
+
+
+def save_engine_overrides(model_type: str, updates: dict):
+    """
+    将托盘切换的引擎级设置写入 runtime_config.json 并同步内存。
+
+    Args:
+        model_type: 引擎标识（'qwen_asr' 等）
+        updates: {字段名: 新值}，白名单外的键会被丢弃
+    """
+    import json
+    model_type = str(model_type).lower()
+    valid = _ENGINE_OVERRIDE_KEYS.get(model_type, ())
+    clean = {k: v for k, v in updates.items() if k in valid}
+    if not clean:
+        return False
+    try:
+        data = {}
+        if _RUNTIME_CONFIG_PATH.exists():
+            data = json.loads(_RUNTIME_CONFIG_PATH.read_text(encoding='utf-8'))
+            if not isinstance(data, dict):
+                data = {}
+        eo = data.get('engine_overrides')
+        if not isinstance(eo, dict):
+            eo = {}
+        slot = eo.get(model_type)
+        if not isinstance(slot, dict):
+            slot = {}
+        slot.update(clean)
+        eo[model_type] = slot
+        data['engine_overrides'] = eo
+        _RUNTIME_CONFIG_PATH.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding='utf-8'
+        )
+        # 同步内存副本，供 get_engine_overrides / EngineFactory 使用
+        mem = _ENGINE_OVERRIDES.setdefault(model_type, {})
+        mem.update(clean)
+        return True
+    except Exception as _e:
+        print(f"[config_server] 保存 runtime_config.json 失败: {_e}")
+        return False
 
 
 def save_runtime_overrides(overrides: dict):
