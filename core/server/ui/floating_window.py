@@ -31,6 +31,23 @@ class FloatingWindow:
         self._visible = False
         self._pending_show = None  # (message, position) 等待显示
         self._pending_hide = False  # 等待隐藏
+        # 浮窗尺寸（加宽到 420 以容纳长文件名；高度按内容自适应）
+        self._win_width = 420
+        self._win_height = 80
+
+    @staticmethod
+    def _fit_font_size(text: str) -> int:
+        """根据文字长度选择字号，长文本用小字以避免撑爆窗口。"""
+        if not text:
+            return 13
+        n = len(text)
+        if n <= 16:
+            return 13
+        if n <= 28:
+            return 12
+        if n <= 40:
+            return 11
+        return 10
 
     def show(self, message: str = "正在加载模型，请稍候...", position: str = "center"):
         """
@@ -80,7 +97,13 @@ class FloatingWindow:
         """在 Tk 线程中执行更新"""
         if self._label is not None:
             try:
-                self._label.config(text=message)
+                # 文字变化时同步字号 + 换行宽度，让长文件名自适应不撑爆
+                font_size = self._fit_font_size(message)
+                self._label.config(
+                    text=message,
+                    font=("Microsoft YaHei UI", font_size),
+                    wraplength=self._win_width - 40,
+                )
             except Exception:
                 pass
         self._reposition(position)
@@ -90,8 +113,8 @@ class FloatingWindow:
         if self._root is None:
             return
         try:
-            win_width = 320
-            win_height = 80
+            win_width = self._win_width
+            win_height = self._win_height
             screen_width = self._root.winfo_screenwidth()
             screen_height = self._root.winfo_screenheight()
 
@@ -158,8 +181,8 @@ class FloatingWindow:
             pass
 
         # 窗口尺寸
-        win_width = 320
-        win_height = 80
+        win_width = self._win_width
+        win_height = self._win_height
 
         # 默认居中位置
         screen_width = root.winfo_screenwidth()
@@ -185,14 +208,17 @@ class FloatingWindow:
         # 背景色
         root.configure(bg='#2b2b2b')
 
-        # 文字标签
+        # 文字标签（字号根据文字长度自适应，避免长文件名撑爆窗口）
+        font_size = self._fit_font_size(message)
         label = tk.Label(
             root,
             text=message,
-            font=("Microsoft YaHei UI", 13),
+            font=("Microsoft YaHei UI", font_size),
             fg='white',
             bg='#2b2b2b',
-            wraplength=280
+            wraplength=self._win_width - 40,
+            justify='left',
+            anchor='w',
         )
         label.pack(expand=True, fill='both', padx=15, pady=10)
 

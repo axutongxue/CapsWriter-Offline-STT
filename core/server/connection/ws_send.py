@@ -1,7 +1,8 @@
 import json
 import asyncio
+import threading
 from multiprocessing import Queue
-from typing import Optional
+from typing import Dict, Optional
 
 from ..state import console
 from ..schema import Result
@@ -10,16 +11,34 @@ from core.tools.asyncio_to_thread import to_thread
 from .. import logger
 
 
-# 本地转录结果队列（用于 Server 端直接转录文件时接收结果）
-_local_transcribe_queue: Optional[Queue] = None
+# 本地转录结果队列：按 task_id 维护独立队列，避免多 transcriber 共享队列时的
+# task_id 不匹配 put-back / ping-pong / 残留泄漏问题。ws_send 按 task_id 路由。
+_local_queues: Dict[str, Queue] = {}
+_local_queues_lock = threading.Lock()
 
 
-def get_local_transcribe_queue() -> Queue:
-    """获取本地转录结果队列（懒初始化）"""
-    global _local_transcribe_queue
-    if _local_transcribe_queue is None:
-        _local_transcribe_queue = Queue()
-    return _local_transcribe_queue
+def register_local_queue(task_id: str) -> Queue:
+    """为指定 task_id 注册一个独立的结果队列，返回该队列。"""
+    q: Queue = Queue()
+    with _local_queues_lock:
+        _local_queues[task_id] = q
+    return q
+
+
+def unregister_local_queue(task_id: str) -> None:
+    """注销（删除）指定 task_id 的结果队列。"""
+    with _local_queues_lock:
+        _local_queues.pop(task_id, None)
+
+
+def route_local_result(result) -> bool:
+    """将本地转录结果路由到对应 task_id 的队列。返回是否成功路由。"""
+    with _local_queues_lock:
+        q = _local_queues.get(result.task_id)
+    if q is None:
+        return False
+    q.put(result)
+    return True
 
 
 async def ws_send(app):
@@ -48,11 +67,14 @@ async def ws_send(app):
                 logger.info("[ws_send] 取到模型加载信号(True)，跳过")
                 continue
 
-            # 本地转录结果：路由到专门的队列，不通过 WebSocket 发送
+            # 本地转录结果：按 task_id 路由到专门队列，不通过 WebSocket 发送。
+            # 若对应 task_id 无队列（如 transcriber 已超时退出或被注销），丢弃并告警。
             if result.socket_id == 'local_transcribe':
-                local_queue = get_local_transcribe_queue()
-                local_queue.put(result)
-                logger.info(f"本地转录结果已路由, 任务ID: {result.task_id}, 进度: {result.duration:.2f}s")
+                routed = route_local_result(result)
+                if routed:
+                    logger.info(f"本地转录结果已路由, 任务ID: {result.task_id}, 进度: {result.duration:.2f}s")
+                else:
+                    logger.warning(f"本地转录结果无归属队列（task_id={result.task_id}），丢弃")
                 continue
 
             # 1. 将内部 Result 转换为标准的协议消息对象

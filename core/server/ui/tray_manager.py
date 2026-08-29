@@ -477,20 +477,34 @@ class TrayManager:
             except Exception as e:
                 logger.debug(f"气泡通知失败: {e}")
 
-    def set_transcribe_progress(self, filename: str, processed: float, total: float):
+    def set_transcribe_progress(
+        self,
+        filename: str,
+        processed: float,
+        total: float,
+        batch_total: int = 0,
+        batch_index: int = 0,
+    ):
         """
-        更新转录进度（tooltip + 无气泡通知）
+        更新转录进度 tooltip。
+
+        显示批次进度、文件名和剩余时间。Windows tooltip 有 ~128 字符上限，
+        但单文件名 + 进度通常足够短；若文件名极长可被系统截断，属可接受行为。
 
         Args:
             filename: 正在转录的文件名
             processed: 已处理的音频时长（秒）
             total: 音频总时长（秒）
+            batch_total: 批量总数（0 表示非批量）
+            batch_index: 当前文件序号（1-based）
         """
+        prefix = f"[{batch_index}/{batch_total}] " if batch_total > 0 else ""
+        fname = f"{prefix}{filename}  " if filename else ""
         if total > 0:
             remaining = max(0, total - processed)
-            tooltip_text = f"CapsWriter - 转录中… 预计剩余 {remaining:.0f}s"
+            tooltip_text = f"{fname}CapsWriter - 转录中… 预计剩余 {remaining:.0f}s"
         else:
-            tooltip_text = f"CapsWriter - 转录中… {processed:.1f}s"
+            tooltip_text = f"{fname}CapsWriter - 转录中… {processed:.1f}s"
         self.update_tooltip(tooltip_text)
 
     def clear_transcribe_progress(self):

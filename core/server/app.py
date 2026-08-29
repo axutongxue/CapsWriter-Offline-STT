@@ -19,6 +19,7 @@ import json
 import asyncio
 import socket
 import threading
+import random
 from pathlib import Path
 from typing import List, Optional
 
@@ -40,7 +41,7 @@ class CapsWriterServer:
     
     管理的外部接口极其简洁：start()。
     """
-    def __init__(self, files: Optional[List[Path]] = None):
+    def __init__(self, files: Optional[List[Path]] = None, raw_args: Optional[List[str]] = None):
         # 确保正确的工作目录
         self.base_dir = Path(__file__).parents[2]
         os.chdir(self.base_dir)
@@ -74,10 +75,15 @@ class CapsWriterServer:
 
         # 文件转录相关
         self.files = files or []
+        # 原始命令行入参（含目录），用于 client 模式把目录原样转发给已有 server
+        # （让 server 端 batch_transcribe 用 expand_paths 展开为同一批次 [1/N]..[N/N]）
+        self.raw_args = raw_args or [str(f) for f in self.files]
         self.floating_window = FloatingWindow()
 
         self.version = __version__
         self.is_alive = False
+        self._port_holder = None  # 端口占位 socket，serve 前释放
+        self._asr_process_dead = False  # ASR 子进程崩溃标记，让 batch worker 停止剩余文件
 
 
     def _print_banner(self):
@@ -96,13 +102,26 @@ class CapsWriterServer:
         """
         # 防连续触发
         if not self.is_alive: return
-        self.is_alive = False 
+        self.is_alive = False
 
         logger.info("=" * 50)
         logger.info("开始清理服务端资源...")
 
+        # 0. 停止批量转录工作者线程（投递 sentinel 并等待其退出）
+        try:
+            from .connection.ws_recv import stop_batch_worker, _BATCH_WORKER_THREAD
+            stop_batch_worker()
+            if _BATCH_WORKER_THREAD is not None:
+                _BATCH_WORKER_THREAD.join(timeout=3)
+                logger.info("批量转录工作者线程已停止")
+        except Exception as e:
+            logger.debug(f"停止批量工作者线程失败: {e}")
+
         # 关闭悬浮窗（如果还在显示）
         self.floating_window.close()
+
+        # 释放端口占位 socket（若还持有）
+        self._release_port_holder()
 
         self.state.queue_out.put(None)
 
@@ -131,7 +150,7 @@ class CapsWriterServer:
     def start(self):
         """
         同步启动服务端 (主入口)
-        
+
         注册信号处理、拉起子进程并进入网络服务监听循环。
         """
         # 防连续触发
@@ -141,14 +160,19 @@ class CapsWriterServer:
         # 注册退出信号处理
         register_signal(self.stop)
 
-        # 检查是否已有实例运行（单实例检测）
-        if self._is_port_in_use():
+        # 用 bind 原子抢占端口，作为 server / client 角色判定。
+        # Windows 下若端口已被占用，bind 立即抛 WinError 10048 → 我方为 client。
+        # 失败者不加载模型，直接把文件发给已有实例后退出，避免：
+        #   1) 多实例都加载模型浪费资源；
+        #   2) bind 阶段崩溃 → 本实例的文件无人转录（旧代码"只转录一个文件"根因）。
+        # 失败者稍等后再试连接 6016，若成功说明 server 已在线（旧实例/新任 server）
+        # 若连接也失败，则随机退避重试（给 server 加载监听留时间）。
+        if not self._try_bind_port():
+            # 端口被占用（已有实例运行）→ 走 client 路径
             if self.files:
-                # 有文件要转录 → 发送给已有实例
-                logger.info("检测到已有 CapsWriter Server 实例运行")
-                self._send_files_to_existing_instance()
+                logger.info("检测到已有 CapsWriter Server 实例运行，转发送模式")
+                self._send_files_to_existing_instance_with_retry()
             else:
-                # 无文件但端口冲突 → 提示用户
                 logger.error(f"端口 {Config.addr}:{Config.port} 已被占用，无法启动服务端")
                 console.print(f'[red]端口 {Config.addr}:{Config.port} 已被占用[/red]')
                 console.print('[yellow]请检查是否已有 CapsWriter Server 正在运行[/yellow]')
@@ -184,101 +208,119 @@ class CapsWriterServer:
             # 提前注册本地转录的 socket_id
             if 'local_transcribe' not in self.state.sockets_id:
                 self.state.sockets_id.append('local_transcribe')
-            
-            def _run_transcribe():
-                try:
-                    self._transcribe_files()
-                except Exception as e:
-                    logger.error(f"转录线程异常: {e}", exc_info=True)
-            
-            threading.Thread(
-                target=_run_transcribe,
-                daemon=True
-            ).start()
+
+            # 统一走批量队列：由 ws_recv.batch_transcribe → 单工作者线程依次转录。
+            # 不再单独起 _transcribe_files 线程直转，避免直转路径与 batch worker
+            # 并发运行两个 ServerFileTranscriber 而冲突（ASR 引擎竞争 / UI 互相覆盖）。
+            from .connection.ws_recv import batch_transcribe
+            batch_transcribe(self, self.files)
         else:
             logger.info("没有待转录文件")
 
         # 开启网络服务监听 (接管当前线程直至退出)
+        # 万一在 _try_bind_port 后、websockets.serve 前，又有实例先 bind 了 6016
+        # （极端竞态），这里兜住 OSError，优雅转 client 而非弹错框崩溃。
         try:
-            self.loop.run_until_complete(self.socket_manager.start()) 
+            self.loop.run_until_complete(self.socket_manager.start())
         except RuntimeError:
             pass
+        except OSError as e:
+            logger.warning(f"websockets.serve 绑定失败（{e}），转为发送模式")
+            self.is_alive = False
+            if self.files:
+                self._send_files_to_existing_instance_with_retry()
+            else:
+                logger.error(f"端口 {Config.addr}:{Config.port} 绑定失败，无法启动服务端")
 
 
-    def _is_port_in_use(self) -> bool:
-        """检测 Server 端口是否已被占用（即是否已有实例运行）"""
-        # 使用连接检测而非绑定检测，避免 0.0.0.0 的兼容性问题
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.connect(('127.0.0.1', int(Config.port)))
-                return True  # 连接成功说明端口已被占用
-            except socket.error:
-                return False
-
-
-    def _send_files_to_existing_instance(self):
+    def _try_bind_port(self) -> bool:
         """
-        将文件路径发送给已运行的 Server 实例，然后退出
+        用 bind 原子抢占端口，成功则保持 listening 占住端口（不 close），
+        交由 SocketManager.start 在 websockets.serve 之前瞬间释放。
+        这样在整个模型加载期间（数秒）端口都被本实例独占，其它实例 bind 立即失败
+        → 走 client 路径，不会出现"两个实例都当 server、落后者浪费一次模型加载"。
+        不设 SO_REUSEADDR / SO_REUSEPORT。
+        """
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind((Config.addr, int(Config.port)))
+            s.listen(1)
+            self._port_holder = s  # 保持占有，serve 前释放
+            logger.info(f"已抢占端口 {Config.addr}:{Config.port}（占位 listening）")
+            return True
+        except socket.error as e:
+            logger.info(f"端口抢占失败（{e}），判定为已有实例运行")
+            return False
 
-        通过 WebSocket 连接到已有实例，发送文件转录请求。
+
+    def _release_port_holder(self):
+        """释放占位 socket，供 websockets.serve 立即重新 bind。"""
+        s = getattr(self, '_port_holder', None)
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+            self._port_holder = None
+
+
+    def _send_files_to_existing_instance_with_retry(self):
+        """
+        向已有实例发送文件路径，带重试：第一次发送若连不上，
+        说明可能所有实例都还在加载模型、server 尚未 listening。
+        随机退避重试最多 ~30s。
+        """
+        import time
+        import random
+        max_attempts = 15
+        for attempt in range(max_attempts):
+            ok = self._send_files_to_existing_instance()
+            if ok:
+                return
+            # 发送失败：server 可能还没 listening，随机退避后重试
+            backoff = 0.5 + random.random() * 1.0
+            logger.info(f"发送失败，{backoff:.1f}s 后重试 ({attempt + 1}/{max_attempts})")
+            time.sleep(backoff)
+        logger.error(f"发送文件到已有实例失败，已重试 {max_attempts} 次")
+        console.print(f'[red]连接已有 CapsWriter Server 实例失败，请确认 Server 正在运行[/red]')
+
+
+    def _send_files_to_existing_instance(self) -> bool:
+        """
+        将原始入参（含目录）批量发送给已运行的 Server 实例，然后退出。
+
+        通过 WebSocket 连接到已有实例，发送一条 transcribe_files 批量消息，
+        由已有实例的 batch_transcribe 统一展开、并入同一批次转录。
+        返回是否成功发送（供重试逻辑判断）。
         """
         import websockets
 
-        async def _send():
-            uri = f"ws://127.0.0.1:{Config.port}"
+        async def _send() -> bool:
+            # 用 Config.addr 作为连接目标；若 server 绑 0.0.0.0/::，回退到 127.0.0.1
+            host = Config.addr if Config.addr not in ('0.0.0.0', '::') else '127.0.0.1'
+            uri = f"ws://{host}:{Config.port}"
             try:
-                async with websockets.connect(uri, subprotocols=["binary"]) as ws:
-                    for file_path in self.files:
-                        # 发送文件路径消息
-                        msg = json.dumps({
-                            "type": "transcribe_file",
-                            "path": str(file_path)
-                        }, ensure_ascii=False)
-                        await ws.send(msg)
-                        logger.info(f"已发送文件路径到已有实例: {file_path}")
+                async with websockets.connect(uri, subprotocols=["binary"], open_timeout=5) as ws:
+                    # 用 raw_args（含目录）发，server 端 expand_paths 展开，
+                    # 这样 300 个文件聚成一个批次 [1/300]..[300/300]
+                    msg = json.dumps({
+                        "type": "transcribe_files",
+                        "paths": [str(p) for p in self.raw_args],
+                    }, ensure_ascii=False)
+                    await ws.send(msg)
+                    logger.info(f"已发送批量请求到已有实例: {len(self.raw_args)} 项")
                     # 等待一小段时间确保消息被接收
                     await asyncio.sleep(0.5)
+                    return True
             except Exception as e:
-                logger.error(f"连接已有实例失败: {e}")
-                console.print(f'[red]连接已有 CapsWriter Server 实例失败: {e}[/red]')
-                console.print('[yellow]请确认 Server 正在运行，或手动重启[/yellow]')
+                logger.warning(f"连接已有实例失败: {e}")
+                return False
 
         try:
-            self.loop.run_until_complete(_send())
+            ok = self.loop.run_until_complete(_send())
+            logger.info("文件路径已发送，当前实例退出")
+            return bool(ok)
         except Exception as e:
             logger.error(f"发送文件到已有实例异常: {e}")
-
-        logger.info("文件路径已发送，当前实例退出")
-
-
-    def _transcribe_files(self):
-        """
-        在后台线程中转录所有文件
-
-        逐个转录文件，更新托盘 tooltip。
-        浮窗在模型加载阶段已显示，转录完成后关闭。
-        """
-        logger.info(f"转录线程启动，共 {len(self.files)} 个文件待转录")
-        for file_path in self.files:
-            try:
-                logger.info(f"开始转录: {file_path}")
-
-                transcriber = ServerFileTranscriber(self, file_path)
-                transcriber.set_progress_callback(
-                    lambda p, t, fn=file_path.name: self.tray_manager.set_transcribe_progress(fn, p, t)
-                )
-
-                success = transcriber.transcribe()
-
-                if success:
-                    logger.info(f"转录成功: {file_path}")
-                else:
-                    logger.error(f"转录失败: {file_path}")
-
-            except Exception as e:
-                logger.error(f"转录异常: {file_path}, 错误: {e}", exc_info=True)
-
-        # 所有文件转录完成，关闭浮窗，清除进度
-        self.floating_window.close()
-        self.tray_manager.clear_transcribe_progress()
-        logger.info("所有文件转录完成")
+            return False

@@ -36,6 +36,7 @@ class ServerConfig:
     file_save_txt = True       # 是否保存 txt 文本（按标点切分后的）
     file_save_json = False     # 是否保存 json 结果（含原始字级时间戳，供手动校正后重新生成 srt）
     file_save_merge = False    # 是否保存 merge.txt（未切分的段落长文本）
+    skip_existing = True      # 批量转录时跳过已转录文件（同名 .txt 已存在则跳过）
 
     # 识别参数
     context = ''               # 提示词上下文，辅助识别专有名词（如人名、地名、术语）
@@ -43,8 +44,8 @@ class ServerConfig:
 
     # GPU 预加速配置（有识别任务时，提前调高显存频率，降低延迟，需管理员权限运行）
     gpu_boost_enabled = True                    # 总开关，默认开启
-    gpu_boost_cmd = 'nvidia-smi -lmc 9000'      # GPU 预加速命令，锁定显存频率到9000MHz（根据实际 GPU 调整）
-    gpu_unboost_cmd = 'nvidia-smi -rmc'         # GPU 取消预加速命令，恢复显存到默认频率
+    gpu_boost_cmd = 'nvidia-smi -lmc 9000'      # NVIDIA：锁显存到9000MHz。AMD 可改 'rocm-smi --setperflevel high'（需 ROCm+管理员），不存在则静默跳过
+    gpu_unboost_cmd = 'nvidia-smi -rmc'         # NVIDIA：恢复默认。AMD 可改 'rocm-smi --setperflevel auto'
     gpu_unboost_timeout = 1                     # 空闲多少秒后取消加速
 
     # 集成显卡兼容性补丁（托盘菜单可切换，改后需重启生效）

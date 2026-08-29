@@ -7,9 +7,10 @@
 
 结果路由说明：
   - ws_send 在主进程 asyncio 循环中从 queue_out 取结果
-  - 当 socket_id == 'local_transcribe' 时，ws_send 将结果路由到 _local_transcribe_queue
-  - ServerFileTranscriber 从 _local_transcribe_queue 取结果
-  - 避免了直接从 queue_out 取结果导致的竞态条件
+  - 当 socket_id == 'local_transcribe' 时，ws_send 按 task_id 路由到 per-task 队列
+  - ServerFileTranscriber 注册自己 task_id 的专属队列，只从中取结果
+  - per-task 队列避免旧实现中单一共享队列 + task_id 过滤导致的
+    put-back ping-pong / 残留泄漏 / 120s 静默放弃等问题
 
 输出格式由 ServerConfig 控制：
   - file_save_txt  : smart_split 后的切分文本（每行一句）
@@ -56,10 +57,32 @@ class ServerFileTranscriber:
         self.task_id = str(uuid.uuid1())
         self._audio_duration: float = 0.0
         self._progress_callback: Optional[Callable] = None
+        self._needs_requeue: bool = False  # ASR 重启成功后，提示 batch worker 把本文件重新入队
 
     def set_progress_callback(self, callback: Callable):
         """设置进度回调，回调参数为 (processed_seconds, total_seconds)"""
         self._progress_callback = callback
+
+    def _is_asr_process_dead(self) -> bool:
+        """检测 ASR 子进程是否已退出/崩溃。"""
+        try:
+            p = getattr(self.app.state, 'recognize_process', None)
+            if p is None:
+                return True  # 没有子进程引用，视为不可用
+            if hasattr(p, 'is_alive') and not p.is_alive():
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _try_restart_asr(self) -> bool:
+        """尝试自动重启 ASR 子进程。成功返回 True。"""
+        try:
+            pm = self.app.process_manager
+            return bool(pm.restart())
+        except Exception as e:
+            logger.error(f"重启 ASR 子进程异常: {e}")
+            return False
 
     @staticmethod
     def smart_split(text: str, min_chars: int = 2) -> str:
@@ -108,7 +131,10 @@ class ServerFileTranscriber:
             "-of", "default=noprint_wrappers=1:nokey=1", str(self.file)
         ]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
             if result.returncode == 0:
                 return float(result.stdout.strip())
         except Exception as e:
@@ -123,7 +149,7 @@ class ServerFileTranscriber:
             bool: 是否成功完成转录
         """
         logger.info(f"ServerFileTranscriber.transcribe() called for: {self.file}")
-        
+
         if not self._check_environment():
             logger.error(f"环境检查失败: ffmpeg not found in PATH")
             return False
@@ -138,31 +164,49 @@ class ServerFileTranscriber:
         self._audio_duration = self._get_audio_duration()
         logger.info(f"音频时长获取完成: {self._audio_duration:.2f}s, 任务ID: {self.task_id}")
 
+        # 时长为 0 通常是文件损坏（moov atom 丢失等）/无音轨，跳过避免浪费 ffmpeg + 一轮 ASR
+        if self._audio_duration <= 0:
+            logger.warning(
+                f"音频时长为 0，可能文件损坏或无音轨，跳过: {self.file}"
+            )
+            return False
+
         state = self.app.state
 
         # 确保本地转录的 socket_id 在共享列表中，防止 TaskHandler 跳过
         if LOCAL_SOCKET_ID not in state.sockets_id:
             state.sockets_id.append(LOCAL_SOCKET_ID)
 
+        # 注册本任务专属的结果队列（ws_send 按 task_id 路由）。
+        # 不再使用单一共享队列 + task_id 过滤，避免并发 transcriber 之间的
+        # put-back ping-pong 与残留泄漏。无论成功失败都要注销。
+        from .connection.ws_send import register_local_queue, unregister_local_queue
+        local_queue = register_local_queue(self.task_id)
+        logger.info(f"已注册本地结果队列, task_id={self.task_id}")
+
         # FFmpeg 提取音频
         ffmpeg_path = get_ffmpeg()
         if ffmpeg_path is None:
             logger.error("环境检查异常：实际启动 ffmpeg 时未找到可执行文件")
+            unregister_local_queue(self.task_id)
             return False
         ffmpeg_cmd = [
             ffmpeg_path, "-i", str(self.file),
             "-f", "f32le", "-ac", "1", "-ar", "16000", "-"
         ]
 
+        process = None
         try:
             process = subprocess.Popen(
                 ffmpeg_cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
             logger.info(f"FFmpeg 进程已启动, PID: {process.pid}")
         except Exception as e:
             logger.error(f"FFmpeg 启动失败: {e}")
+            unregister_local_queue(self.task_id)
             return False
 
         # 分段参数（从 Config 取，文件转录场景可适当加大 overlap 提升拼接质量）
@@ -182,91 +226,139 @@ class ServerFileTranscriber:
         bytes_read = 0
         seg_count = 0
 
-        # 读取并分段提交
-        while True:
-            chunk = process.stdout.read(65536)
-            if not chunk:
-                break
-            buffer += chunk
-            bytes_read += len(chunk)
-
-            # 达到分段阈值时提交
-            while len(buffer) >= segment_bytes:
-                seg_count += 1
-                segment_data = buffer[:segment_bytes]
-                buffer = buffer[stride_bytes:]
-
-                task = Task(
-                    type='file',
-                    data=segment_data,
-                    offset=offset,
-                    task_id=self.task_id,
-                    socket_id=LOCAL_SOCKET_ID,
-                    overlap=seg_overlap,
-                    is_final=False,
-                    time_start=time.time(),
-                    time_submit=time.time(),
-                    context=task_context,
-                    language=task_language,
-                )
-                offset += seg_duration
-                state.queue_in.put(task)
-
-                # 进度回调（基于已发送的音频时长）
-                if self._progress_callback:
-                    processed = bytes_read / AudioFormat.BYTES_PER_SECOND
-                    self._progress_callback(processed, self._audio_duration)
-
-        # 提交剩余数据作为最终片段
-        logger.info(f"FFmpeg 读取完成, 共读取 {bytes_read} 字节, 提交 {seg_count} 个分段")
-        task = Task(
-            type='file',
-            data=buffer if buffer else b'',
-            offset=offset,
-            task_id=self.task_id,
-            socket_id=LOCAL_SOCKET_ID,
-            overlap=seg_overlap if buffer else 0,
-            is_final=True,
-            time_start=time.time(),
-            time_submit=time.time(),
-            context=task_context,
-            language=task_language,
-        )
-        state.queue_in.put(task)
-
-        process.wait()
-        logger.info("音频数据发送完成，等待识别结果...")
-
-        # 从本地转录队列收集结果（ws_send 负责路由到这里）
-        from .connection.ws_send import get_local_transcribe_queue
-        local_queue = get_local_transcribe_queue()
-        logger.info(f"开始从 local_queue 等待结果, task_id={self.task_id}, queue_empty={local_queue.empty()}")
-
         final_result = None
-        while True:
-            try:
-                logger.info(f"正在 local_queue.get() 等待, task_id={self.task_id}...")
-                result = local_queue.get(timeout=120)  # 最多等 120 秒
-                logger.info(f"从 local_queue 取到结果: task_id={result.task_id}, is_final={result.is_final}, socket_id={result.socket_id}")
-
-                # 过滤：只关注当前 task_id 的结果
-                if result.task_id != self.task_id:
-                    # 不是当前任务的结果，放回队列
-                    local_queue.put(result)
-                    logger.info(f"结果不属于当前任务，放回队列: result_task_id={result.task_id}, my_task_id={self.task_id}")
-                    continue
-
-                if result.is_final:
-                    final_result = result
+        try:
+            # 读取并分段提交
+            while True:
+                chunk = process.stdout.read(65536)
+                if not chunk:
                     break
-                else:
-                    # 非最终结果，更新进度
-                    if self._progress_callback and self._audio_duration > 0:
-                        self._progress_callback(result.duration, self._audio_duration)
+                buffer += chunk
+                bytes_read += len(chunk)
 
-            except Exception as e:
-                logger.error(f"等待识别结果超时或出错: {e}")
-                return False
+                # 达到分段阈值时提交
+                while len(buffer) >= segment_bytes:
+                    seg_count += 1
+                    segment_data = buffer[:segment_bytes]
+                    buffer = buffer[stride_bytes:]
+
+                    task = Task(
+                        type='file',
+                        data=segment_data,
+                        offset=offset,
+                        task_id=self.task_id,
+                        socket_id=LOCAL_SOCKET_ID,
+                        overlap=seg_overlap,
+                        is_final=False,
+                        time_start=time.time(),
+                        time_submit=time.time(),
+                        context=task_context,
+                        language=task_language,
+                    )
+                    offset += seg_duration
+                    state.queue_in.put(task)
+
+                    # 进度回调（基于已发送的音频时长）
+                    if self._progress_callback:
+                        processed = bytes_read / AudioFormat.BYTES_PER_SECOND
+                        self._progress_callback(processed, self._audio_duration)
+
+            # 提交剩余数据作为最终片段
+            logger.info(f"FFmpeg 读取完成, 共读取 {bytes_read} 字节, 提交 {seg_count} 个分段")
+            task = Task(
+                type='file',
+                data=buffer if buffer else b'',
+                offset=offset,
+                task_id=self.task_id,
+                socket_id=LOCAL_SOCKET_ID,
+                overlap=seg_overlap if buffer else 0,
+                is_final=True,
+                time_start=time.time(),
+                time_submit=time.time(),
+                context=task_context,
+                language=task_language,
+            )
+            state.queue_in.put(task)
+
+            process.wait()
+            logger.info("音频数据发送完成，等待识别结果...")
+
+            logger.info(f"开始从 local_queue 等待结果, task_id={self.task_id}")
+
+            # 从本任务专属队列收集结果。由于是 per-task 队列，不再需要 task_id 过滤，
+            # 也不会与其他 transcriber 互相 put-back。
+            # 等待策略：每 60s 一次 get(timeout=60)。
+            # 每次超时检测 ASR 子进程是否还活着——若子进程已崩溃（模型推理 hang 后被
+            # OS 释放等情况），立即放弃，避免逐文件傻等 600s 的死循环（200 文件场景
+            # 会浪费数小时）。
+            consecutive_timeouts = 0
+            while True:
+                try:
+                    result = local_queue.get(timeout=60)
+                    consecutive_timeouts = 0
+                    logger.info(f"从 local_queue 取到结果: task_id={result.task_id}, is_final={result.is_final}")
+
+                    if result.is_final:
+                        final_result = result
+                        break
+                    else:
+                        # 非最终结果，更新进度
+                        if self._progress_callback and self._audio_duration > 0:
+                            self._progress_callback(result.duration, self._audio_duration)
+
+                except Exception as e:
+                    # 单次 get 超时（queue.Empty）或其它异常：先检测子进程是否还活着
+                    consecutive_timeouts += 1
+                    asr_dead = self._is_asr_process_dead()
+                    if asr_dead:
+                        # ASR 子进程崩溃。尝试自动重启子进程（最多 3 次）。
+                        # 重启成功后清空 _asr_process_dead 标记，本文件由 batch worker
+                        # 重新入队重转；重启失败才真正放弃。
+                        logger.error(f"ASR 子进程已崩溃/退出: {self.file}")
+                        restarted = self._try_restart_asr()
+                        if restarted:
+                            # 告知 batch worker 把本文件重新入队重转
+                            self._needs_requeue = True
+                            return False
+                        # 重启失败：标记批次停止
+                        try:
+                            self.app._asr_process_dead = True
+                        except Exception:
+                            pass
+                        return False
+
+                    # 子进程还活着，但偶尔一次 60s 超时可能是高负载/长音频，继续等
+                    if consecutive_timeouts >= 10:
+                        # 连续 10 * 60s = 10 分钟仍无任何结果，判定为卡死。
+                        # 这种情况子进程还在但卡住，先尝试 restart 再判定
+                        logger.error(
+                            f"连续 {consecutive_timeouts * 60}s 无识别结果，"
+                            f"判定 ASR 卡死，尝试重启子进程: {self.file}"
+                        )
+                        restarted = self._try_restart_asr()
+                        if restarted:
+                            self._needs_requeue = True
+                            return False
+                        try:
+                            self.app._asr_process_dead = True
+                        except Exception:
+                            pass
+                        return False
+                    logger.warning(
+                        f"等待识别结果超时 ({consecutive_timeouts * 60}s)，"
+                        f"ASR 子进程仍存活，继续等待: {self.file}"
+                    )
+                    continue
+        finally:
+            # 无论成功/失败/超时，都确保 ffmpeg 被清理、结果队列被注销。
+            if process is not None and process.poll() is None:
+                try:
+                    process.kill()
+                    process.wait(timeout=5)
+                    logger.info(f"已清理残留 FFmpeg 进程, PID: {process.pid}")
+                except Exception as e:
+                    logger.warning(f"清理 FFmpeg 进程失败: {e}")
+            unregister_local_queue(self.task_id)
 
         # 热词后处理：音素纠错 + 规则替换 + token 同步
         # 即使没有热词库也安全（apply 内部会跳过）；任何异常都不阻断保存流程
